@@ -550,6 +550,8 @@ pop_many_patches()
 
 	(
 		cd_to_toplevel
+		DIFF_TMP=`get_tmp_file diff`
+		SUBMODULE_UPDATES_TMP=`get_tmp_file diff`
 
 		# remove the patches refs
 		tail -n $2 < "$applied" | remove_patch_refs
@@ -567,6 +569,23 @@ pop_many_patches()
 			msg="popping $2 patches: now at `tail -1 \"$applied.tmp\"`"
 		fi
 
+		# FIXME: We should use "-z" so that we can handle
+		# unusual characters in filenames.  Handling the
+		# quoting versions documented in core.quotePath (see
+		# git-config(1)) is too errorprone and too hard to do
+		# from a shellscript.  Then again, handling the "-z"
+		# output format is also too hard to do from a
+		# shellscript.
+		#
+		# For now, just handle easy filenames.  Once this
+		# works, we can write a small portable C program to
+		# handle this...
+		git diff -r --raw --abbrev=40 --ignore-submodules=none "$1" HEAD > "$DIFF_TMP"
+		sed -n 's/:000000 160000 0000000000000000000000000000000000000000 [0-9a-f]* A	//p' "$DIFF_TMP" | while read fn
+		do
+			git submodule deinit $fn
+		done
+
 		GIT_REFLOG_ACTION="$GIT_REFLOG_ACTION: $msg" git reset --hard "$1" > /dev/null
 
 		mv "$applied.tmp" "$applied"
@@ -575,6 +594,13 @@ pop_many_patches()
 			git symbolic-ref -m "$GIT_REFLOG_ACTION: restoring branch $branch" HEAD refs/heads/$branch
 			git update-ref -d refs/heads/$GUILT_PREFIX$branch
 		fi
+
+		sed -n 's/:160000 160000 [0-9a-f]* [0-9a-f]* M[0-9]*	//p' "$DIFF_TMP" | while read fn
+		do
+			git submodule update $fn
+		done
+
+		rm -f "$DIFF_TMP"
 	)
 }
 
@@ -679,9 +705,25 @@ commit()
 push_patch()
 {
 	__push_patch_bail=0
+	if [ -z "$EXTRACT_SUBMODULE" ]
+	then
+		es=extract-submodule.py
+		if [ -r "$GUILT_PATH/../lib/guilt/$es" ]
+		then
+			export EXTRACT_SUBMODULE="$GUILT_PATH/../lib/guilt/$es"
+		elif [ -r "$GUILT_PATH/$es" ]
+		then
+			export EXTRACT_SUBMODULE="$GUILT_PATH/$es"
+		else
+			disp "Can't find $es" >&2
+			exit 1
+		fi
+	fi
+
 
 	(
 		TMP_LOG=`get_tmp_file log`
+		DIFF_TMP=`get_tmp_file diff`
 
 		p="$GUILT_DIR/$branch/$1"
 		pname="$1"
@@ -690,6 +732,7 @@ push_patch()
 
 		assert_head_check
 		cd_to_toplevel
+		before=`git rev-parse HEAD`
 
 		# apply the patch if and only if there is something to apply
 		if [ `do_get_patch "$p" | wc -l` -gt 0 ]; then
@@ -703,7 +746,7 @@ push_patch()
 			if [ $__push_patch_bail -ne 0 ]; then
 				cat "$TMP_LOG" >&2
 				if [ "$bail_action" = "abort" ]; then
-					rm -f "$TMP_LOG" "$TMP_MSG"
+					rm -f "$TMP_LOG" "$TMP_MSG" "$DIFF_TMP"
 					return $__push_patch_bail
 				fi
 			fi
@@ -712,9 +755,39 @@ push_patch()
 		GIT_REFLOG_ACTION="$GIT_REFLOG_ACTION: $pname" \
 			commit "$pname" HEAD
 
+		git diff -r --raw --abbrev=40 --ignore-submodules=none $before HEAD > "$DIFF_TMP"
+		sed -n 's/:000000 160000 0000000000000000000000000000000000000000 [0-9a-f]* A	//p' "$DIFF_TMP" | while read fn
+		do
+			git submodule update --init $fn
+		done
+
+		"$EXTRACT_SUBMODULE" "$p" > "$DIFF_TMP"
+		need_refresh=false
+		while read old new file
+		do
+			(cd $file && git checkout $new)
+			git add $file
+			need_refresh=true
+		done < "$DIFF_TMP"
+
 		echo "$pname" >> "$applied"
 
-		rm -f "$TMP_LOG"
+		rm -f "$TMP_LOG" "$DIFF_TMP"
+
+		if $need_refresh
+		then
+			oldcommitish=`git rev-parse HEAD`
+			git commit --amend --no-edit
+			commitish=`git rev-parse HEAD`
+			if $old_style_prefix || git rev-parse --verify --quiet refs/heads/$GUILT_PREFIX$branch >/dev/null
+			then
+				git update-ref -m "$GIT_REFLOG_ACTION: update submodules" HEAD $commitish
+			else
+				git branch $GUILT_PREFIX$branch $commitish
+				git symbolic-ref -m "$GIT_REFLOG_ACTION: update submodules" HEAD refs/heads/$GUILT_PREFIX$branch
+			fi
+			git update-ref "refs/patches/$branch/$pname" HEAD
+		fi
 	)
 
 	# sub-shell funky-ness
@@ -728,7 +801,8 @@ must_commit_first()
 {
 	git update-index --refresh --unmerged -q > /dev/null
 	[ `git diff-files | wc -l` -eq 0 ] || return $?
-	[ `git diff-index HEAD | wc -l` -eq 0 ]
+	[ `git diff-index HEAD | wc -l` -eq 0 ] || return $?
+	[ `git submodule foreach --quiet --recursive git status --porcelain | wc -l` -eq 0 ]
 	return $?
 }
 
@@ -1019,5 +1093,9 @@ if [ -n "`get_top 2>/dev/null`" ]; then
 else
 	old_style_prefix="$reuse_branch"
 fi
+
+# The path to extract-submodule.py.  Set by push_patch when needed;
+# only used by push_patch.
+export EXTRACT_SUBMODULE=""
 
 _main "$@"
