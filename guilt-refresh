@@ -38,6 +38,7 @@ if [ -z "$TOP" ]; then
 	die "No patches applied; try guilt push first"
 fi
 
+GIT_REFLOG_ACTION="$GIT_REFLOG_ACTION: $TOP"
 refresh_patch "$TOP" "$gdiff" "$dstat"
 echo "Patch $TOP refreshed"
 
